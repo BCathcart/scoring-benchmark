@@ -15,46 +15,54 @@ set -euo pipefail
 
 # ============================================================================
 # CONFIG -- edit the values below, then run the script (no arguments needed).
+# Every value can also be overridden from the environment without editing, e.g.
+#   BASE_MODULE=/a/libsearch.so CAND_MODULE=/b/libsearch.so ./search_benchmark.sh
+# so one checked-in copy serves several checkouts and CI-style wrappers.
 # ============================================================================
 
 # The two module .so files to compare (REQUIRED -- fill these in).
 # baseline = the original module; candidate = the new build to compare against.
-BASE_MODULE=""                 # e.g. /path/to/baseline/valkey-search/.build-release/libsearch.so
-CAND_MODULE=""                 # e.g. /path/to/candidate/valkey-search/.build-release/libsearch.so
+BASE_MODULE="${BASE_MODULE:-}"   # e.g. /path/to/baseline/valkey-search/.build-release/libsearch.so
+CAND_MODULE="${CAND_MODULE:-}"   # e.g. /path/to/candidate/valkey-search/.build-release/libsearch.so
 
 # Where to find valkey-server / valkey-cli / valkey-benchmark.
 # Leave empty to auto-detect on $PATH; otherwise point at the directory that
 # holds the three binaries (e.g. a valkey source tree's src/ directory).
-VALKEY_BIN_DIR="/local/home/bodasong/oss/core/valkey/src"
+VALKEY_BIN_DIR="${VALKEY_BIN_DIR:-}"
 
 # Labels shown in the results table.
-BASE_NAME="baseline"
-CAND_NAME="candidate"
+BASE_NAME="${BASE_NAME:-baseline}"
+CAND_NAME="${CAND_NAME:-candidate}"
 
 # Ports for the two throwaway servers.
-BASE_PORT=7779
-CAND_PORT=7780
+BASE_PORT="${BASE_PORT:-7779}"
+CAND_PORT="${CAND_PORT:-7780}"
 
 # Benchmark tuning.
-HOST="127.0.0.1"
-REQUESTS=5000                  # FT.SEARCH requests per run; longer window = less noise
-WARMUP=1                       # seconds of un-recorded warmup before each run
-REPEATS=7                      # odd; report the median (of paired deltas)
-PRECISION=3                    # latency decimal places
-DOC_COUNTS=(1000)              # dataset sizes to sweep
-CONN_COUNTS=(500)              # connection counts to sweep
+HOST="${HOST:-127.0.0.1}"
+REQUESTS="${REQUESTS:-5000}"     # FT.SEARCH requests per run; longer window = less noise
+WARMUP="${WARMUP:-1}"            # seconds of un-recorded warmup before each run
+REPEATS="${REPEATS:-7}"          # odd; report the median (of paired deltas)
+PRECISION="${PRECISION:-3}"      # latency decimal places
+DOC_COUNTS=(${DOC_COUNTS:-1000}) # dataset sizes to sweep (space-separated in env)
+CONN_COUNTS=(${CONN_COUNTS:-500}) # connection counts to sweep (space-separated in env)
+
+# Which scenario set to run: "text" (the original non-positional queries),
+# "positional" (phrase / INORDER / SLOP, which exercise the position merge the
+# text set never touches), or "all".
+SCENARIOS="${SCENARIOS:-all}"
 
 # Output directory for the timestamped log.
-OUTDIR="$(pwd)/output"
+OUTDIR="${OUTDIR:-$(pwd)/output}"
 
 # CPU pinning for measurement stability. Both servers share ONE physical core
 # (benchmarks run serially, so only one is ever hot; identical pinning gives
 # both an identical CPU environment). The client runs on separate cores so it
 # never steals cycles from the core under test. Set PIN=0 to disable, or adjust
 # for your topology (`lscpu -p=CPU,CORE` shows which logical CPUs share a core).
-PIN=1
-SERVER_CPUS=2
-CLIENT_CPUS="6,7"
+PIN="${PIN:-1}"
+SERVER_CPUS="${SERVER_CPUS:-2}"
+CLIENT_CPUS="${CLIENT_CPUS:-6,7}"
 
 # For an A/A noise check, point CAND_MODULE at the same .so as BASE_MODULE:
 # the true delta is then 0%, so every reported delta is the harness noise floor.
@@ -196,34 +204,47 @@ populate() {
 }
 
 # --- query scenarios --------------------------------------------------------
-declare -a NAMES=(
-    "single word"
-    "two words (AND)"
-    "three words (AND)"
-    "OR of two"
-    "OR of three"
-    "text+num+tag"
-    "2w AND+num+tag"
-    "2w OR+num+tag"
-)
-declare -a QUERIES=(
-    "apple"
-    "apple banana"
-    "apple banana cherry"
-    "apple | banana"
-    "apple | banana | cherry"
-    "apple @price:[1 250] @color:{red}"
-    "apple banana @price:[1 250] @color:{red}"
-    "(apple | banana) @price:[1 250] @color:{red}"
-)
+# Each scenario is (name, query, extra FT.SEARCH arguments). The extra arguments
+# are command flags such as INORDER or SLOP, which are not query syntax and so
+# cannot be folded into the query string.
+declare -a NAMES=() QUERIES=() EXTRA_ARGS=()
+add_scenario() { NAMES+=("$1"); QUERIES+=("$2"); EXTRA_ARGS+=("${3:-}"); }
+
+if [[ "$SCENARIOS" == "text" || "$SCENARIOS" == "all" ]]; then
+    add_scenario "single word"        "apple"
+    add_scenario "two words (AND)"    "apple banana"
+    add_scenario "three words (AND)"  "apple banana cherry"
+    add_scenario "OR of two"          "apple | banana"
+    add_scenario "OR of three"        "apple | banana | cherry"
+    add_scenario "text+num+tag"       "apple @price:[1 250] @color:{red}"
+    add_scenario "2w AND+num+tag"     "apple banana @price:[1 250] @color:{red}"
+    add_scenario "2w OR+num+tag"      "(apple | banana) @price:[1 250] @color:{red}"
+fi
+if [[ "$SCENARIOS" == "positional" || "$SCENARIOS" == "all" ]]; then
+    # Every row here makes the text leaves positional, so the per-key position
+    # merge runs on every candidate. The text set above never reaches it.
+    add_scenario "phrase"             '"apple banana"'
+    add_scenario "2w INORDER"         "apple banana"                      "INORDER"
+    add_scenario "2w SLOP 0"          "apple banana"                      "SLOP 0"
+    add_scenario "2w SLOP 2"          "apple banana"                      "SLOP 2"
+    add_scenario "OR of two INORDER"  "apple | banana"                    "INORDER"
+    add_scenario "prefix+word INORDER" "appl* banana"                     "INORDER"
+    add_scenario "phrase+num+tag"     '"apple banana" @price:[1 250] @color:{red}'
+fi
+if [[ ${#NAMES[@]} -eq 0 ]]; then
+    echo "ERROR: SCENARIOS must be text, positional or all (got '$SCENARIOS')" >&2
+    exit 2
+fi
 
 # one benchmark run on $port -> "<rps> <p50>", parsed from the summary line.
 # Client is pinned off the server core and a warmup pass is not recorded.
 run_bench_once() {
-    local port="$1" conn="$2" query="$3"
+    local port="$1" conn="$2" query="$3" extra="$4"
+    # $extra is intentionally unquoted: "SLOP 2" must become two arguments.
+    # shellcheck disable=SC2086
     "${CLIENT_PIN[@]}" "$BENCH" -h "$HOST" -p "$port" -n "$REQUESTS" -c "$conn" \
         --warmup "$WARMUP" --precision "$PRECISION" -q \
-        FT.SEARCH idx "$query" 2>/dev/null \
+        FT.SEARCH idx "$query" $extra 2>/dev/null \
         | grep "requests per second" | tail -n1 \
         | sed -E 's/.*: ([0-9.]+) requests per second.*p50=([0-9.]+).*/\1 \2/'
 }
@@ -243,12 +264,12 @@ median() {
 # (for display only) are the medians of each side. Sets globals
 # B_RPS/B_P50/C_RPS/C_P50 and RPS_DELTA/P50_DELTA.
 run_pair() {
-    local conn="$1" query="$2"
+    local conn="$1" query="$2" extra="$3"
     local b_rps=() b_p50=() c_rps=() c_p50=() rps_d=() p50_d=()
     for _ in $(seq 1 "$REPEATS"); do
         local br bp cr cp
-        read -r br bp < <(run_bench_once "$BASE_PORT" "$conn" "$query")
-        read -r cr cp < <(run_bench_once "$CAND_PORT" "$conn" "$query")
+        read -r br bp < <(run_bench_once "$BASE_PORT" "$conn" "$query" "$extra")
+        read -r cr cp < <(run_bench_once "$CAND_PORT" "$conn" "$query" "$extra")
         br="${br:-0}"; bp="${bp:-0}"; cr="${cr:-0}"; cp="${cp:-0}"
         b_rps+=("$br"); b_p50+=("$bp"); c_rps+=("$cr"); c_p50+=("$cp")
         # per-pair signed % deltas (candidate relative to baseline)
@@ -276,20 +297,24 @@ for docs in "${DOC_COUNTS[@]}"; do
     echo "############################################################"
     populate "$BASE_PORT" "$docs"
     populate "$CAND_PORT" "$docs"
-    echo "   ${BASE_NAME}: DBSIZE=$(vcli "$BASE_PORT" dbsize), apple matches=$(vcli "$BASE_PORT" FT.SEARCH idx 'apple' | head -n1)"
-    echo "   ${CAND_NAME}: DBSIZE=$(vcli "$CAND_PORT" dbsize), apple matches=$(vcli "$CAND_PORT" FT.SEARCH idx 'apple' | head -n1)"
+    for side in BASE CAND; do
+        port_var="${side}_PORT"; name_var="${side}_NAME"
+        echo "   ${!name_var}: DBSIZE=$(vcli "${!port_var}" dbsize)," \
+             "apple matches=$(vcli "${!port_var}" FT.SEARCH idx 'apple' | head -n1)," \
+             "phrase matches=$(vcli "${!port_var}" FT.SEARCH idx '"apple banana"' | head -n1)"
+    done
 
     for conn in "${CONN_COUNTS[@]}"; do
         echo
         echo "  --- c=${conn} connections --- (rps higher=better, p50 ms lower=better)"
-        printf "  %-18s %-20s %-20s %10s %10s\n" \
+        printf "  %-20s %-20s %-20s %10s %10s\n" \
             "scenario" "${BASE_NAME} rps(p50)" "${CAND_NAME} rps(p50)" "rps Δ%" "p50 Δ%"
 
         for i in "${!QUERIES[@]}"; do
-            run_pair "$conn" "${QUERIES[$i]}"
+            run_pair "$conn" "${QUERIES[$i]}" "${EXTRA_ARGS[$i]}"
             # deltas are the MEDIAN of per-pair (interleaved) deltas, so drift
             # cancels: negative rps = candidate slower; positive p50 = worse
-            printf "  %-18s %-20s %-20s %10s %10s\n" \
+            printf "  %-20s %-20s %-20s %10s %10s\n" \
                 "${NAMES[$i]}" \
                 "$(printf '%.0f (%.2f)' "$B_RPS" "$B_P50")" \
                 "$(printf '%.0f (%.2f)' "$C_RPS" "$C_P50")" \
